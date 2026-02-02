@@ -42,16 +42,57 @@ default: build ## Default builds
 help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-23s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
-build: build-dracpu build-test-dracpuinfo build-test-dracputester ## build all the binaries
+build: build-dracpu build-dracpu-admission build-test-dracpuinfo build-test-dracputester ## build all the binaries
 
 build-dracpu: ## build dracpu
 	go build -v -o "$(OUT_DIR)/dracpu" ./cmd/dracpu
+
+build-dracpu-admission: ## build dracpu admission webhook
+	go build -v -o "$(OUT_DIR)/dracpu-admission" ./cmd/dracpu-admission
 
 clean: ## clean
 	rm -rf "$(OUT_DIR)/"
 
 test-unit: ## run tests
 	CGO_ENABLED=1 go test -v -race -count 1 -coverprofile=coverage.out ./pkg/...
+
+test-admission: ## run admission controller tests
+	go test -v ./pkg/admission ./cmd/dracpu-admission
+
+test-e2e-admission: kind-load-test-image ## run admission e2e tests (requires kind cluster)
+	go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"
+
+test-e2e-admission-grouped-mode: kind-load-test-image ## run admission e2e tests in grouped mode
+	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=grouped"]}]'
+	go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"
+
+test-e2e-admission-individual-mode: kind-load-test-image ## run admission e2e tests in individual mode
+	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=individual"]}]'
+	go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"
+
+test-e2e-individual-mode: kind-load-test-image ## run e2e test reserved cpus suite
+	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=individual","--reserved-cpus=$(RESERVED_CPUS_E2E)"]}]'
+	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(RESERVED_CPUS_E2E) DRACPU_E2E_CPU_DEVICE_MODE=individual go test -v ./test/e2e/ --ginkgo.v
+
+test-e2e-grouped-mode: kind-load-test-image ## run e2e test grouped mode suite
+	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=grouped","--reserved-cpus=$(RESERVED_CPUS_E2E)"]}]'
+	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(RESERVED_CPUS_E2E) DRACPU_E2E_CPU_DEVICE_MODE=grouped go test -v ./test/e2e/ --ginkgo.v
+
+test-e2e-all: ## run all e2e tests (admission + cpu allocation)
+	created=0; \
+	while read -r name; do \
+		if [ "$$name" = "$(CLUSTER_NAME)" ]; then created=2; fi; \
+	done < <(kind get clusters); \
+	if [ "$$created" -eq 0 ]; then \
+		kind create cluster --name ${CLUSTER_NAME} --config hack/kind.yaml; \
+		created=1; \
+	fi; \
+	trap 'if [ "$$created" -eq 1 ]; then kind delete cluster --name ${CLUSTER_NAME}; fi' EXIT; \
+	$(MAKE) kind-load-test-image; \
+	mode=$${DRACPU_E2E_CPU_DEVICE_MODE:-grouped}; \
+	reserved=$${DRACPU_E2E_RESERVED_CPUS:-$(RESERVED_CPUS_E2E)}; \
+	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode='"$$mode"'","--reserved-cpus='"$$reserved"'"]}]'; \
+	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$$reserved DRACPU_E2E_CPU_DEVICE_MODE=$$mode go test -v ./test/e2e/ --ginkgo.v
 
 update: ## runs go mod tidy and go get -u
 	go get -u ./...
@@ -110,11 +151,29 @@ kind-cluster:  ## create kind cluster
 kind-load-image: build-image  ## load the current container image into kind
 	kind load docker-image ${IMAGE} ${IMAGE_LATEST} --name ${CLUSTER_NAME}
 
+kind-load-test-image: build-test-image ## load the test image into kind
+	kind load docker-image ${IMAGE_TEST} --name ${CLUSTER_NAME}
+
 kind-uninstall-cpu-dra: ## remove cpu dra from kind cluster
 	kubectl delete -f install.yaml || true
 
+kind-uninstall-admission: ## remove admission controller from kind cluster
+	kubectl delete -f install-admission.yaml || true
+	kubectl -n kube-system delete secret dracpu-admission-tls || true
+
+kind-install-all: kind-install-cpu-dra kind-install-admission ## by default, is grouped mode. Use kind-install-indiviudal-mode to install individual mode
+
+kind-install-individual-mode: kind-install-all ## install individual mode on kind
+	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=individual"]}]'
+
 kind-install-cpu-dra: kind-uninstall-cpu-dra build-image kind-load-image ## install on cluster
 	kubectl apply -f install.yaml
+
+kind-install-admission: kind-uninstall-admission build-image kind-load-image ## install admission controller only
+	kubectl apply -f install-admission.yaml
+	kubectl -n kube-system patch deploy dracpu-admission --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
+	bash hack/webhook/generate-certs.sh
+	kubectl -n kube-system rollout restart deploy dracpu-admission
 
 delete-kind-cluster: ## delete kind cluster
 	kind delete cluster --name ${CLUSTER_NAME}
@@ -169,12 +228,6 @@ build-test-dracputester: ## build helper to serve as entry point and report cpu 
 
 build-test-dracpuinfo: ## build helper to expose hardware info in the internal dracpu format
 	go build -v -o "$(OUT_DIR)/dracpuinfo" ./test/image/dracpuinfo
-
-test-e2e-individual-mode: ## run e2e test reserved cpus suite
-	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(RESERVED_CPUS_E2E) DRACPU_E2E_CPU_DEVICE_MODE=individual go test -v ./test/e2e/ --ginkgo.v
-
-test-e2e-grouped-mode: ## run e2e test grouped mode suite
-	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(RESERVED_CPUS_E2E) DRACPU_E2E_CPU_DEVICE_MODE=grouped go test -v ./test/e2e/ --ginkgo.v
 
 lint:  ## run the linter against the codebase
 	$(GOLANGCI_LINT) run ./...

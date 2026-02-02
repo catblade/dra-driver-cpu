@@ -77,6 +77,22 @@ The driver is deployed as a DaemonSet which contains two core components:
   manifest
   - `kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/dra-driver-cpu/refs/heads/main/install.yaml`
 
+### Validating Admission Controller
+
+The optional validating admission controller rejects invalid `ResourceClaim`
+requests for the `dra.cpu` device class (for example, unsupported allocation
+modes or non-integer capacity requests). It also validates pods so that when a
+CPU request/limit is specified alongside `dra.cpu` claims, the CPU count matches
+the claim count.
+
+To install it:
+
+- Apply the webhook deployment and configuration:
+  - `kubectl apply -f install-admission.yaml`
+- Generate a self-signed certificate, create the TLS secret, and patch the
+  webhook CA bundle:
+  - `hack/webhook/generate-certs.sh`
+
 ### Example Usage
 
 - Create a ResourceClaim: This requests a specific number of exclusive CPUs from

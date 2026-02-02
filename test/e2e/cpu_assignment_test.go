@@ -88,6 +88,10 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 
 		rootFxt, err = fixture.ForGinkgo()
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create root fixture: %v", err)
+		_, err = rootFxt.K8SClientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			ginkgo.Skip(fmt.Sprintf("Cluster cannot be reached. Is a cluster attached for testing? In order to start kind, use make kind-cluster. Error: %v", err))
+		}
 		infraFxt := rootFxt.WithPrefix("infra")
 		gomega.Expect(infraFxt.Setup(ctx)).To(gomega.Succeed())
 		ginkgo.DeferCleanup(infraFxt.Teardown)
@@ -116,13 +120,22 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 		} else {
 			workerNodes, err := node.FindWorkers(ctx, infraFxt.K8SClientset)
 			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot find worker nodes: %v", err)
-			gomega.Expect(workerNodes).ToNot(gomega.BeEmpty(), "no worker nodes detected")
+			if len(workerNodes) == 0 {
+				allNodes, err := infraFxt.K8SClientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+				gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot list nodes: %v", err)
+				for i := range allNodes.Items {
+					if node.IsReady(&allNodes.Items[i]) {
+						workerNodes = append(workerNodes, &allNodes.Items[i])
+					}
+				}
+			}
+			gomega.Expect(workerNodes).ToNot(gomega.BeEmpty(), "no ready nodes detected")
 			targetNode = workerNodes[0] // pick random one, this is the simplest random pick
 		}
 		rootFxt.Log.Info("using worker node", "nodeName", targetNode.Name)
 
 		infoPod := makeDiscoveryPod(infraFxt.Namespace.Name, dracpuTesterImage)
-		infoPod = pinPodToNode(infoPod, targetNode.Name)
+		infoPod = pinPodToNode(infoPod, targetNode)
 		infoPod, err = e2epod.RunToCompletion(ctx, infraFxt.K8SClientset, infoPod)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create discovery pod: %v", err)
 		data, err := e2epod.GetLogs(infraFxt.K8SClientset, ctx, infoPod.Namespace, infoPod.Name, infoPod.Spec.Containers[0].Name)
@@ -189,6 +202,7 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				for i := 0; i < numPods; i++ {
 					gomega.Expect(err).ToNot(gomega.HaveOccurred())
 					pod := makeTesterPodWithExclusiveCPUClaim(fxt.Namespace.Name, dracpuTesterImage, createdClaimTemplate)
+					pod = pinPodToNode(pod, targetNode)
 					createdPod, err := e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
 					gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create tester pod %d: %v", i, err)
 					exclPods = append(exclPods, createdPod)
@@ -364,9 +378,18 @@ func makeDiscoveryPod(ns, image string) *v1.Pod {
 	}
 }
 
-func pinPodToNode(pod *v1.Pod, nodeName string) *v1.Pod {
+func pinPodToNode(pod *v1.Pod, node *v1.Node) *v1.Pod {
 	pod.Spec.NodeSelector = map[string]string{
-		"kubernetes.io/hostname": nodeName,
+		"kubernetes.io/hostname": node.Name,
+	}
+	if len(node.Spec.Taints) > 0 {
+		for _, taint := range node.Spec.Taints {
+			pod.Spec.Tolerations = append(pod.Spec.Tolerations, v1.Toleration{
+				Key:      taint.Key,
+				Operator: v1.TolerationOpExists,
+				Effect:   taint.Effect,
+			})
+		}
 	}
 	return pod
 }
@@ -378,8 +401,10 @@ func identifyPod(pod *v1.Pod) string {
 func mustCreateBestEffortPod(ctx context.Context, fxt *fixture.Fixture, nodeName, dracpuTesterImage string) *v1.Pod {
 	fixture.By("creating a best-effort reference pod")
 	pod := makeTesterPodBestEffort(fxt.Namespace.Name, dracpuTesterImage)
-	pod = pinPodToNode(pod, nodeName)
-	pod, err := e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
+	node, err := fxt.K8SClientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get node %q: %v", nodeName, err)
+	pod = pinPodToNode(pod, node)
+	pod, err = e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create tester pod: %v", err)
 	return pod
 }
