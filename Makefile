@@ -59,26 +59,11 @@ test-unit: ## run tests
 test-admission: ## run admission controller tests
 	go test -v ./pkg/admission ./cmd/dracpu-admission
 
-test-e2e-admission: kind-load-test-image ## run admission e2e tests (requires kind cluster)
-	go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"
-
-test-e2e-admission-grouped-mode: kind-load-test-image ## run admission e2e tests in grouped mode
-	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=grouped"]}]'
-	go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"
-
-test-e2e-admission-individual-mode: kind-load-test-image ## run admission e2e tests in individual mode
-	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=individual"]}]'
-	go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"
-
-test-e2e-individual-mode: kind-load-test-image ## run e2e test reserved cpus suite
-	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=individual","--reserved-cpus=$(RESERVED_CPUS_E2E)"]}]'
-	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(RESERVED_CPUS_E2E) DRACPU_E2E_CPU_DEVICE_MODE=individual go test -v ./test/e2e/ --ginkgo.v
-
-test-e2e-grouped-mode: kind-load-test-image ## run e2e test grouped mode suite
-	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=grouped","--reserved-cpus=$(RESERVED_CPUS_E2E)"]}]'
-	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(RESERVED_CPUS_E2E) DRACPU_E2E_CPU_DEVICE_MODE=grouped go test -v ./test/e2e/ --ginkgo.v
-
-test-e2e-all: ## run all e2e tests (admission + cpu allocation)
+with-kind: ## run a command with a temporary kind cluster
+	@if [ -z "$$CMD" ]; then \
+		echo "CMD is required. Example: CMD='echo hello' $(MAKE) with-kind"; \
+		exit 1; \
+	fi; \
 	created=0; \
 	while read -r name; do \
 		if [ "$$name" = "$(CLUSTER_NAME)" ]; then created=2; fi; \
@@ -88,11 +73,31 @@ test-e2e-all: ## run all e2e tests (admission + cpu allocation)
 		created=1; \
 	fi; \
 	trap 'if [ "$$created" -eq 1 ]; then kind delete cluster --name ${CLUSTER_NAME}; fi' EXIT; \
-	$(MAKE) kind-load-test-image; \
-	mode=$${DRACPU_E2E_CPU_DEVICE_MODE:-grouped}; \
-	reserved=$${DRACPU_E2E_RESERVED_CPUS:-$(RESERVED_CPUS_E2E)}; \
-	kubectl -n kube-system patch daemonset dracpu --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode='"$$mode"'","--reserved-cpus='"$$reserved"'"]}]'; \
-	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$$reserved DRACPU_E2E_CPU_DEVICE_MODE=$$mode go test -v ./test/e2e/ --ginkgo.v
+	bash -c "$$CMD"
+
+test-e2e-admission: ## run admission e2e tests (requires kind cluster)
+	CMD='$(MAKE) kind-load-test-image kind-install-admission; kubectl -n kube-system rollout status deploy dracpu-admission --timeout=120s; kubectl -n kube-system wait --for=condition=ready pod -l app=dracpu-admission --timeout=120s; go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"' \
+		$(MAKE) with-kind
+
+test-e2e-admission-grouped-mode: ## run admission e2e tests in grouped mode
+	CMD='$(MAKE) kind-load-test-image kind-install-admission; kubectl -n kube-system rollout status deploy dracpu-admission --timeout=120s; kubectl -n kube-system wait --for=condition=ready pod -l app=dracpu-admission --timeout=120s; kubectl -n kube-system patch daemonset dracpu --type='"'"'json'"'"' -p='"'"'[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=grouped"]}]'"'"'; go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"' \
+		$(MAKE) with-kind
+
+test-e2e-admission-individual-mode: ## run admission e2e tests in individual mode
+	CMD='$(MAKE) kind-load-test-image kind-install-admission; kubectl -n kube-system rollout status deploy dracpu-admission --timeout=120s; kubectl -n kube-system wait --for=condition=ready pod -l app=dracpu-admission --timeout=120s; kubectl -n kube-system patch daemonset dracpu --type='"'"'json'"'"' -p='"'"'[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=individual"]}]'"'"'; go test -v ./test/e2e/ --ginkgo.v --ginkgo.focus="Admission Webhook"' \
+		$(MAKE) with-kind
+
+test-e2e-individual-mode: ## run e2e test reserved cpus suite
+	CMD='$(MAKE) kind-load-test-image kind-install-cpu-dra kind-install-admission; kubectl -n kube-system rollout status deploy dracpu-admission --timeout=120s; kubectl -n kube-system wait --for=condition=ready pod -l app=dracpu-admission --timeout=120s; kubectl -n kube-system patch daemonset dracpu --type='"'"'json'"'"' -p='"'"'[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=individual","--reserved-cpus=$(RESERVED_CPUS_E2E)"]}]'"'"'; env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(RESERVED_CPUS_E2E) DRACPU_E2E_CPU_DEVICE_MODE=individual go test -v ./test/e2e/ --ginkgo.v' \
+		$(MAKE) with-kind
+
+test-e2e-grouped-mode: ## run e2e test grouped mode suite
+	CMD='$(MAKE) kind-load-test-image kind-install-cpu-dra kind-install-admission; kubectl -n kube-system rollout status deploy dracpu-admission --timeout=120s; kubectl -n kube-system wait --for=condition=ready pod -l app=dracpu-admission --timeout=120s; kubectl -n kube-system patch daemonset dracpu --type='"'"'json'"'"' -p='"'"'[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=grouped","--reserved-cpus=$(RESERVED_CPUS_E2E)"]}]'"'"'; env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(RESERVED_CPUS_E2E) DRACPU_E2E_CPU_DEVICE_MODE=grouped go test -v ./test/e2e/ --ginkgo.v' \
+		$(MAKE) with-kind
+
+test-e2e-all: ## run all e2e tests (admission + cpu allocation)
+	CMD='$(MAKE) kind-load-test-image kind-install-cpu-dra kind-install-admission; kubectl -n kube-system rollout status deploy dracpu-admission --timeout=120s; kubectl -n kube-system wait --for=condition=ready pod -l app=dracpu-admission --timeout=120s; reserved=$${DRACPU_E2E_RESERVED_CPUS:-$(RESERVED_CPUS_E2E)}; kubectl -n kube-system patch daemonset dracpu --type='"'"'json'"'"' -p='"'"'[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=grouped","--reserved-cpus='"'"'$$reserved'"'"'"]}]'"'"'; env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$$reserved DRACPU_E2E_CPU_DEVICE_MODE=grouped go test -v ./test/e2e/ --ginkgo.v; kubectl -n kube-system patch daemonset dracpu --type='"'"'json'"'"' -p='"'"'[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["/dracpu","--v=4","--cpu-device-mode=individual","--reserved-cpus='"'"'$$reserved'"'"'"]}]'"'"'; env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$$reserved DRACPU_E2E_CPU_DEVICE_MODE=individual go test -v ./test/e2e/ --ginkgo.v' \
+		$(MAKE) with-kind
 
 update: ## runs go mod tidy and go get -u
 	go get -u ./...
@@ -132,6 +137,15 @@ image: ## docker build load
 	docker build . -t ${STAGING_IMAGE_NAME} --load
 
 build-image: ## build image
+	@if [ "$(FORCE_BUILD)" = "1" ]; then \
+		$(MAKE) build-image-force; \
+	elif docker image inspect "${IMAGE}" >/dev/null 2>&1; then \
+		echo "Image ${IMAGE} already exists; skipping build."; \
+	else \
+		$(MAKE) build-image-force; \
+	fi
+
+build-image-force: ## force build image
 	docker buildx build . \
 		--platform="${PLATFORMS}" \
 		--tag="${IMAGE}" \
@@ -217,6 +231,15 @@ ci-kind-setup-grouped-mode: ci-manifests-grouped-mode build-image build-test-ima
 	$(call kind_setup,hack/ci/install-ci-grouped-mode.yaml)
 
 build-test-image: ## build tests image
+	@if [ "$(FORCE_BUILD)" = "1" ]; then \
+		$(MAKE) build-test-image-force; \
+	elif docker image inspect "${IMAGE_TEST}" >/dev/null 2>&1; then \
+		echo "Image ${IMAGE_TEST} already exists; skipping build."; \
+	else \
+		$(MAKE) build-test-image-force; \
+	fi
+
+build-test-image-force: ## force build tests image
 	docker buildx build . \
 		--file test/image/Dockerfile \
 		--platform="${PLATFORMS}" \
