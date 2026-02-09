@@ -66,6 +66,73 @@ The driver is deployed as a DaemonSet which contains two core components:
 - This driver currently only manages CPU resources. Memory allocation and management are not supported.
 - While the driver is topology-aware, the grouped mode currently abstracts some of the fine-grained details within the group. Future enhancements may explore combining [consumable capacity](https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/5075-dra-consumable-capacity/README.md) with [partitionable devices](https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/4815-dra-partitionable-devices/README.md) for more hierarchical control.
 
+#### Sharing resource claims
+
+This driver strictly enforces a 1-to-1 mapping between Claims and Containers.
+It does not support sharing a single ResourceClaim among multiple containers or multiple pods,
+if that claims includes a resource (`dra.cpu`) managed by this driver.
+Attempting to share a claim among containers or pods will make all but the first pod consuming
+the claim to fail to start with the error `CreateContainerError` and remain in `Pending` state.
+
+The rationale to disallow sharing is that sharing claim confuses resource accounting, which
+is currently fragile because the lack of integration between the classic resource accounting
+and DRA-managed core resources.
+
+This gap is meant to be addressed by KEP-5517 (Native Resource Management). However, until
+that KEP progresses and gets traction, the safest approach for this driver is to prevent
+any resource claim sharing.
+
+### Matching CPU Manager functionality
+
+The kubelet cpumanager support [options](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/#cpu-policy-static--options) to fine-tune the CPU allocation behavior.
+This DRA driver aims to implement feature parity with the kubelet cpumanager. The following table summarize how you can achieve a cpumananger functionality controlled by a cpumanager policy option.
+Reference: [kubernetes 1.35.0](https://github.com/kubernetes/kubernetes/blob/v1.35.0/pkg/kubelet/cm/cpumanager/policy_options.go).
+
+| CPU Manager Option        | Maturity | Kubelet development status | Driver equivalent functionality                                        | notes                 |
+| ------------------------- | -------- | -------------------------- | ---------------------------------------------------------------------- | --------------------- |
+| AlignBySocket             | alpha    | inactive                   | `--grouped-mode` driver option                                         |                       |
+| DistributeCPUsAcrossCores | alpha    | inactive                   | none yet; postponed till k8s feature graduates to beta                 |                       |
+| DistributeCPUsAcrossNUMA  | beta     | active                     | see issue: https://github.com/kubernetes-sigs/dra-driver-cpu/issues/46 | see below for details |
+| PreferAlignByUnCoreCache  | beta     | active                     | builtin; enabled by default                                            |                       |
+| FullPCPUsOnly             | GA       | N/A                        | see issue: https://github.com/kubernetes-sigs/dra-driver-cpu/issues/45 |                       |
+| StrictCPUReservation      | GA       | N/A                        | builtin; enabled by default                                            |                       |
+
+### Distributing CPUs across NUMA nodes
+
+It is currently possible to do encode a split of CPUs in such a way the allocator picks them from different NUMA nodes. Example:
+
+```
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: claim-cpu-capacity-20
+spec:
+  devices:
+    requests:
+    - name: numa0-cpus
+      exactly:
+        deviceClassName: dra.cpu
+        capacity:
+          requests:
+            dra.cpu/cpu: "10"
+        selectors:
+        - cel:
+            expression: device.attributes["dra.cpu"].numaNodeID == 0
+    - name: numa1-cpus
+      exactly:
+        deviceClassName: dra.cpu
+        capacity:
+          requests:
+            dra.cpu/cpu: "10"
+        selectors:
+        - cel:
+            expression: device.attributes["dra.cpu"].numaNodeID ==1
+```
+
+However, this is only a partial replacement of the corresponding CPU Manager option. The main problem of this approach is that it leaks assumptions about machine properties.
+We hardcode the NUMA split and, unlike the cpumanager feature, it won't automatically adapt if the same claim is handled by a 1-NUMA, 2-NUMA or 4-NUMA machine;
+the claim would need to be updated or recreated manually.
+
 ## Getting Started
 
 ### Installation
@@ -95,12 +162,19 @@ To install it:
 
 ### Example Usage
 
-- Create a ResourceClaim: This requests a specific number of exclusive CPUs from
-  the driver.
-  - `kubectl apply -f hack/examples/sample_cpu_resource_claims.yaml`
-- Create a Pod: Reference the ResourceClaim in your pod spec to receive the
-  allocated CPUs.
-  - `kubectl apply -f hack/examples/sample_pod_with_cpu_resource_claim.yaml`
+The driver supports two modes of operation. Each mode has a complete example manifest that includes both the ResourceClaim(s) and a sample Pod. The ResourceClaim requests a specific number of exclusive CPUs from the driver, and is referenced in the Pod spec to receive the allocated CPUs.
+
+#### Grouped Mode (default)
+
+In grouped mode, CPUs are requested as a consumable capacity from a device group (e.g., NUMA node or socket). This example requests 10 CPUs.
+
+- `kubectl apply -f hack/examples/pod_with_resource_claim_grouped_mode.yaml`
+
+#### Individual Mode
+
+In individual mode, specific CPU devices are requested by count, allowing for fine-grained control over CPU selection. This example includes two ResourceClaims requesting 4 and 6 CPUs respectively, used by a Pod with multiple containers.
+
+- `kubectl apply -f hack/examples/pod_with_resource_claim_individual_mode.yaml`
 
 ## Example ResourceSlices
 
@@ -211,17 +285,38 @@ spec:
     name: cpudevnuma1
 ```
 
+### Running the tests
+
+To run the e2e tests against a custom-setup, special-purpose kind cluster, just run
+
+```bash
+make test-e2e-kind
+```
+
+Set the environment variable `DRACPU_E2E_VERBOSE` to 1 for more output:
+
+```bash
+DRACPU_E2E_VERBOSE=1 make test-e2e-kind
+```
+
+In some cases, you may need to set explicitly the KUBECONFIG path:
+
+```bash
+KUBECONFIG=${HOME}/.kube/config DRACPU_E2E_VERBOSE=1 make test-e2e-kind
+```
+
+The `test-e2e-kind` will exercises the same flows which are run on the project CI.
+The full documentation for all the supported environment variables is found in the [tests README](test/e2e/README.md).
+
+**NOTE** the custom-setup kind cluster is _not_ automatically tear down once the tests terminate
+**NOTE** if you want to run again the tests, just use `make test-e2e`. Please see `make help` for more details.
+
 ## Community, discussion, contribution, and support
 
 Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/).
+Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](code-of-conduct.md).
 
 You can reach the maintainers of this project at:
 
-- [Slack](https://slack.k8s.io/)
+- [Slack](https://slack.k8s.io/) - preferred channels: #sig-node #wg-device-management
 - [Mailing List](https://groups.google.com/a/kubernetes.io/g/dev)
-
-### Code of conduct
-
-Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](code-of-conduct.md).
-
-This project is managed by its [OWNERS](https://git.k8s.io/community/contributors/guide/owners.md) and is licensed under [Creative Commons 4.0](https://git.k8s.io/website/LICENSE).
