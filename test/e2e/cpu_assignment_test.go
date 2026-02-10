@@ -131,7 +131,7 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 		}
 		rootFxt.Log.Info("using worker node", "nodeName", targetNode.Name)
 
-	infoPod := discovery.MakePod(infraFxt.Namespace.Name, dracpuTesterImage)
+		infoPod := discovery.MakePod(infraFxt.Namespace.Name, dracpuTesterImage)
 		infoPod = pinPodToNode(infoPod, targetNode)
 		infoPod, err = e2epod.RunToCompletion(ctx, infraFxt.K8SClientset, infoPod)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create discovery pod: %v", err)
