@@ -33,6 +33,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -43,18 +44,22 @@ import (
 )
 
 const (
-	defaultBindAddress = ":9443"
-	maxBodyBytes       = 1 << 20
+	defaultBindAddress        = ":9443"
+	maxBodyBytes              = 1 << 20
+	defaultClaimGetRetryWait  = 50 * time.Millisecond
+	defaultClaimGetRetryTotal = 500 * time.Millisecond
 )
 
 var (
-	bindAddress   string
-	tlsCertFile   string
-	tlsKeyFile    string
-	kubeconfig    string
-	driverName    string
-	healthzPath   string
-	healthzStatus atomicBool
+	bindAddress        string
+	tlsCertFile        string
+	tlsKeyFile         string
+	kubeconfig         string
+	driverName         string
+	healthzPath        string
+	claimGetRetryWait  time.Duration
+	claimGetRetryTotal time.Duration
+	healthzStatus      atomicBool
 )
 
 type atomicBool struct{ v int32 }
@@ -82,12 +87,16 @@ func init() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Absolute path to the kubeconfig file (optional)")
 	flag.StringVar(&driverName, "driver-name", admission.DefaultDriverName, "DRA driver name to validate for")
 	flag.StringVar(&healthzPath, "healthz-path", "/healthz", "Health check path")
+	flag.DurationVar(&claimGetRetryWait, "claim-get-retry-wait", defaultClaimGetRetryWait, "Delay between ResourceClaim get retries when claim is not found")
+	flag.DurationVar(&claimGetRetryTotal, "claim-get-retry-total", defaultClaimGetRetryTotal, "Total ResourceClaim get retry window when claim is not found")
 }
 
 // main initializes the admission webhook server and runs until shutdown. Returns: nothing.
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+	claimGetRetryWait = durationFromEnv("DRACPU_ADMISSION_CLAIM_GET_RETRY_WAIT", claimGetRetryWait)
+	claimGetRetryTotal = durationFromEnv("DRACPU_ADMISSION_CLAIM_GET_RETRY_TOTAL", claimGetRetryTotal)
 
 	// Create a client for fetching ResourceClaims referenced by pods.
 	clientset, err := newClientset(kubeconfig)
@@ -140,13 +149,20 @@ func main() {
 }
 
 type admissionHandler struct {
-	driverName string
-	clientset  kubernetes.Interface
+	driverName         string
+	clientset          kubernetes.Interface
+	claimGetRetryWait  time.Duration
+	claimGetRetryTotal time.Duration
 }
 
 // newAdmissionHandler constructs an HTTP handler with driver configuration. Returns: handler.
 func newAdmissionHandler(driverName string, clientset kubernetes.Interface) http.Handler {
-	return &admissionHandler{driverName: driverName, clientset: clientset}
+	return &admissionHandler{
+		driverName:         driverName,
+		clientset:          clientset,
+		claimGetRetryWait:  claimGetRetryWait,
+		claimGetRetryTotal: claimGetRetryTotal,
+	}
 }
 
 // ServeHTTP validates admission review POSTs and writes the response. Returns: nothing.
@@ -357,9 +373,31 @@ func cpuRequestCount(requests corev1.ResourceList) (int64, bool) {
 // claimCPUCount totals dra.cpu device requests within a ResourceClaim. Returns: total, error.
 func (h *admissionHandler) claimCPUCount(namespace, name string) (int64, error) {
 	// Fetch the ResourceClaim and sum CPU requests for this driver.
-	claim, err := h.clientset.ResourceV1().ResourceClaims(namespace).Get(context.Background(), name, metav1.GetOptions{})
-	if err != nil {
-		return 0, err
+	// Claims can be created asynchronously (for example from Pod claim templates),
+	// so retry briefly on NotFound before treating the claim as not yet available.
+	var claim *resourceapi.ResourceClaim
+	var err error
+	totalWait := h.claimGetRetryTotal
+	if totalWait < 0 {
+		totalWait = 0
+	}
+	retryWait := h.claimGetRetryWait
+	if retryWait <= 0 {
+		retryWait = defaultClaimGetRetryWait
+	}
+	deadline := time.Now().Add(totalWait)
+	for {
+		claim, err = h.clientset.ResourceV1().ResourceClaims(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		if err == nil {
+			break
+		}
+		if !apierrors.IsNotFound(err) {
+			return 0, err
+		}
+		if time.Now().After(deadline) {
+			return 0, nil
+		}
+		time.Sleep(retryWait)
 	}
 
 	// Prefer allocated device info when available.
@@ -376,6 +414,19 @@ func (h *admissionHandler) claimCPUCount(namespace, name string) (int64, error) 
 	}
 
 	return total, nil
+}
+
+func durationFromEnv(name string, fallback time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		klog.Warningf("invalid %s=%q: %v; using %s", name, raw, err, fallback)
+		return fallback
+	}
+	return value
 }
 
 // claimCPUCountFromSlices counts CPU total by looking up allocated devices in ResourceSlices. Returns: total, error.

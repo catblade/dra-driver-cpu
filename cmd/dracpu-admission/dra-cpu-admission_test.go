@@ -68,6 +68,24 @@ func TestValidatePodClaims_NoCPURequestWithClaimSucceeds(t *testing.T) {
 	}
 }
 
+// TestValidatePodClaims_MissingClaimDoesNotFail allows asynchronous claim creation.
+func TestValidatePodClaims_MissingClaimDoesNotFail(t *testing.T) {
+	handler := &admissionHandler{
+		driverName: admission.DefaultDriverName,
+		clientset:  fake.NewSimpleClientset(),
+	}
+
+	pod := podWithClaims("default", "pod-missing-claim", "claim-ref", "claim-does-not-exist")
+	pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
+		corev1.ResourceCPU: resource.MustParse("2"),
+	}
+
+	errs := handler.validatePodClaims(pod)
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+}
+
 // TestValidatePodClaims_NoCPUAndNoClaimSkipsValidation ensures no-op behavior.
 func TestValidatePodClaims_NoCPUAndNoClaimSkipsValidation(t *testing.T) {
 	handler := &admissionHandler{

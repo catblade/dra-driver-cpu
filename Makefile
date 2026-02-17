@@ -186,6 +186,9 @@ kind-install-cpu-dra: kind-uninstall-cpu-dra build-image kind-load-image ## inst
 kind-install-admission: kind-uninstall-admission build-image kind-load-image ## install admission controller only
 	kubectl apply -f install-admission.yaml
 	kubectl -n kube-system patch deploy dracpu-admission --type='json' -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
+	kubectl -n kube-system set env deploy/dracpu-admission \
+		DRACPU_ADMISSION_CLAIM_GET_RETRY_WAIT="$(ADMISSION_CLAIM_GET_RETRY_WAIT)" \
+		DRACPU_ADMISSION_CLAIM_GET_RETRY_TOTAL="$(ADMISSION_CLAIM_GET_RETRY_TOTAL)"
 	bash hack/webhook/generate-certs.sh
 	kubectl -n kube-system rollout restart deploy dracpu-admission
 
@@ -218,6 +221,8 @@ define generate_ci_manifest
 endef
 
 RESERVED_CPUS_E2E ?= 0
+ADMISSION_CLAIM_GET_RETRY_WAIT ?= 50ms
+ADMISSION_CLAIM_GET_RETRY_TOTAL ?= 500ms
 ci-manifests-individual-mode: install.yaml install-yq ## create the CI install manifests for the individual mode test variant
 	$(call generate_ci_manifest,hack/ci/install-ci-individual-mode.yaml,.spec.template.spec.containers[0].args |= (del(.[] | select(. == "--cpu-device-mode=*")) | . + ["--cpu-device-mode=individual", "--reserved-cpus=$(RESERVED_CPUS_E2E)"]))
 
