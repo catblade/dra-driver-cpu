@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -435,7 +436,7 @@ func (h *admissionHandler) claimCPUCountFromSlices(claim *resourceapi.ResourceCl
 		return 0, nil
 	}
 
-	deviceNames := make(map[string]struct{})
+	deviceNames := sets.New[string]()
 	for _, result := range claim.Status.Allocation.Devices.Results {
 		if result.Driver != h.driverName {
 			continue
@@ -443,9 +444,9 @@ func (h *admissionHandler) claimCPUCountFromSlices(claim *resourceapi.ResourceCl
 		if result.Device == "" {
 			continue
 		}
-		deviceNames[result.Device] = struct{}{}
+		deviceNames.Insert(result.Device)
 	}
-	if len(deviceNames) == 0 {
+	if deviceNames.Len() == 0 {
 		return 0, nil
 	}
 
