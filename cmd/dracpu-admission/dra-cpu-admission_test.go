@@ -173,12 +173,7 @@ func TestValidatePodClaims_IndividualSliceUsesCoreID(t *testing.T) {
 
 // TestCPURequestCount_RoundsFractionalToOne verifies fractional CPU rounds up to 1.
 func TestCPURequestCount_RoundsFractionalToOne(t *testing.T) {
-	count, specified := cpuRequestCount(corev1.ResourceList{
-		corev1.ResourceCPU: resource.MustParse("500m"),
-	})
-	if !specified {
-		t.Fatal("expected cpu to be specified")
-	}
+	count := cpuRequestCount(resource.MustParse("500m"))
 	if count != 1 {
 		t.Fatalf("expected count to round to 1, got %d", count)
 	}

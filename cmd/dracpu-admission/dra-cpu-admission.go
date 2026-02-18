@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -127,12 +128,14 @@ func main() {
 		WriteTimeout:      10 * time.Second,
 	}
 
-	healthzStatus.Store(true)
-
 	go func() {
-		// Start serving TLS requests until shutdown is triggered.
 		klog.Infof("Starting validating admission server on %s", bindAddress)
-		if err := server.ListenAndServeTLS(tlsCertFile, tlsKeyFile); err != nil && err != http.ErrServerClosed {
+		listener, err := tls.Listen("tcp", server.Addr, mustTLSConfig(tlsCertFile, tlsKeyFile))
+		if err != nil {
+			klog.Fatalf("Webhook server listen failed: %v", err)
+		}
+		healthzStatus.Store(true)
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			klog.Fatalf("Webhook server failed: %v", err)
 		}
 	}()
@@ -288,6 +291,15 @@ func newClientset(kubeconfigPath string) (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(config)
 }
 
+// mustTLSConfig loads cert and key and returns a TLS config for the server. Exits on error.
+func mustTLSConfig(certFile, keyFile string) *tls.Config {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		klog.Fatalf("failed to load TLS cert/key: %v", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}
+}
+
 // validatePodClaims enforces CPU request parity with dra.cpu claims. Returns: validation errors.
 func (h *admissionHandler) validatePodClaims(pod *corev1.Pod) []string {
 
@@ -298,12 +310,10 @@ func (h *admissionHandler) validatePodClaims(pod *corev1.Pod) []string {
 	// Build a map from pod claim references to actual ResourceClaim names.
 	claimNameToResource := make(map[string]string)
 	for _, rc := range pod.Spec.ResourceClaims {
-		if rc.Name == "" {
+		if rc.Name == "" || rc.ResourceClaimName == nil {
 			continue
 		}
-		if rc.ResourceClaimName != nil {
-			claimNameToResource[rc.Name] = *rc.ResourceClaimName
-		}
+		claimNameToResource[rc.Name] = *rc.ResourceClaimName
 	}
 
 	if len(claimNameToResource) == 0 {
@@ -313,7 +323,11 @@ func (h *admissionHandler) validatePodClaims(pod *corev1.Pod) []string {
 	var errs []string
 	for _, container := range pod.Spec.Containers {
 		// Extract the integer CPU request for this container.
-		cpuRequestValue, cpuSpecified := cpuRequestCount(container.Resources.Requests)
+		cpuRequestValue := int64(0)
+		cpuQuantity, cpuSpecified := container.Resources.Requests[corev1.ResourceCPU]
+		if cpuSpecified {
+			cpuRequestValue = cpuRequestCount(cpuQuantity)
+		}
 		// Sum the CPU count across all dra.cpu claims referenced by the container.
 		totalClaimCPUs := int64(0)
 		for _, claim := range container.Resources.Claims {
@@ -348,27 +362,22 @@ func (h *admissionHandler) validatePodClaims(pod *corev1.Pod) []string {
 	return errs
 }
 
-// cpuRequestCount parses CPU requests into integer count plus flags. Returns: count, specified.
-func cpuRequestCount(requests corev1.ResourceList) (int64, bool) {
-	// Return request count and whether CPU was specified.
-	cpuQuantity, ok := requests[corev1.ResourceCPU]
-	if !ok {
-		return 0, false
-	}
+// cpuRequestCount normalizes a CPU quantity to integer cores. Returns: count.
+func cpuRequestCount(cpuQuantity resource.Quantity) int64 {
 	value, ok := cpuQuantity.AsInt64()
 	if !ok {
 		// Round any fractional CPU request up to 1.
-		return 1, true
+		return 1
 	}
 	if value < 1 {
-		return 1, true
+		return 1
 	}
 	intQuantity := resource.NewQuantity(value, cpuQuantity.Format)
 	if cpuQuantity.Cmp(*intQuantity) != 0 {
 		// Round any fractional CPU request up to 1.
-		return 1, true
+		return 1
 	}
-	return value, true
+	return value
 }
 
 // claimCPUCount totals dra.cpu device requests within a ResourceClaim. Returns: total, error.
@@ -474,8 +483,8 @@ func (h *admissionHandler) claimCPUCountFromSlices(claim *resourceapi.ResourceCl
 			continue
 		}
 
-		// If a grouped mode, the dra.cpu/cpu capacity will be defined; otherwise count one per device.
-		if capacity, ok := capacities[resourceapi.QualifiedName("dra.cpu/cpu")]; ok {
+		// If grouped mode, capacity carries core count; otherwise each device is one core.
+		if capacity, ok := capacities[admission.CPUResourceQualifiedNameKey]; ok {
 			total += capacity.Value.Value()
 			continue
 		}

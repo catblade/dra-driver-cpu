@@ -19,13 +19,14 @@ package admission
 import (
 	"fmt"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/identifiers"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 const (
-	DefaultDriverName           = "dra.cpu"
-	CPUResourceQualifiedNameKey = resourceapi.QualifiedName("dra.cpu/cpu")
+	DefaultDriverName           = identifiers.DriverName
+	CPUResourceQualifiedNameKey = identifiers.CPUResourceQualifiedNameKey
 )
 
 // ValidateResourceClaim validates dra.cpu-specific rules on a ResourceClaim.
@@ -46,7 +47,7 @@ func ValidateResourceClaim(claim *resourceapi.ResourceClaim, driverName string) 
 		}
 		for _, subRequest := range request.FirstAvailable {
 			if subRequest.DeviceClassName == driverName {
-				errs = append(errs, fmt.Sprintf("request %q: firstAvailable is not supported for %s", request.Name, driverName))
+				errs = append(errs, fmt.Sprintf("request %q: DRA prioritized lists is not supported for %s", request.Name, driverName))
 				break
 			}
 		}
@@ -62,12 +63,12 @@ func validateExactDeviceRequest(requestName string, req *resourceapi.ExactDevice
 		return errs
 	}
 
-	if req.AdminAccess != nil && *req.AdminAccess {
-		errs = append(errs, fmt.Sprintf("request %q: adminAccess is not supported for %s", requestName, driverName))
-	}
-
 	if req.AllocationMode != "" && req.AllocationMode != resourceapi.DeviceAllocationModeExactCount {
 		errs = append(errs, fmt.Sprintf("request %q: allocationMode %q is not supported for %s", requestName, req.AllocationMode, driverName))
+	}
+
+	if req.AdminAccess != nil && *req.AdminAccess {
+		errs = append(errs, fmt.Sprintf("request %q: adminAccess is not supported for %s", requestName, driverName))
 	}
 
 	count := req.Count

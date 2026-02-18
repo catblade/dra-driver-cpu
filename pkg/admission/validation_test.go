@@ -103,7 +103,7 @@ func TestValidateResourceClaim_FirstAvailableNotSupported(t *testing.T) {
 	}
 
 	errs := ValidateResourceClaim(claim, DefaultDriverName)
-	assertErrorsContain(t, errs, "firstAvailable is not supported")
+	assertErrorsContain(t, errs, "DRA prioritized lists is not supported")
 }
 
 // newResourceClaim builds a ResourceClaim with a single request.
