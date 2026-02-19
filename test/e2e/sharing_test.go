@@ -19,6 +19,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"time"
 
@@ -80,7 +81,9 @@ var _ = ginkgo.Describe("Claim sharing", ginkgo.Serial, ginkgo.Ordered, ginkgo.C
 				cpuDeviceMode = val
 			}
 		}
-		gomega.Expect(dsReservedCPUs.Equals(reservedCPUs)).To(gomega.BeTrue(), "daemonset reserved cpus %v do not match test reserved cpus %v", dsReservedCPUs.String(), reservedCPUs.String())
+		// Treat "no reserved cpus" as equal whether from zero value or parsed empty (daemonset may omit the arg or use empty value).
+		bothEmpty := dsReservedCPUs.IsEmpty() && reservedCPUs.IsEmpty()
+		gomega.Expect(bothEmpty || dsReservedCPUs.Equals(reservedCPUs)).To(gomega.BeTrue(), "daemonset reserved cpus %v do not match test reserved cpus %v", dsReservedCPUs.String(), reservedCPUs.String())
 
 		rootFxt.Log.Info("daemonset configuration", "reservedCPUs", dsReservedCPUs.String(), "deviceMode", cpuDeviceMode)
 
@@ -88,28 +91,29 @@ var _ = ginkgo.Describe("Claim sharing", ginkgo.Serial, ginkgo.Ordered, ginkgo.C
 			targetNode, err = rootFxt.K8SClientset.CoreV1().Nodes().Get(ctx, targetNodeName, metav1.GetOptions{})
 			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get worker node %q: %v", targetNodeName, err)
 		} else {
-			workerNodes, err := node.FindWorkers(ctx, infraFxt.K8SClientset)
-			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot find worker nodes: %v", err)
-			if len(workerNodes) == 0 {
-				allNodes, err := infraFxt.K8SClientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-				gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot list nodes: %v", err)
-				for i := range allNodes.Items {
-					if node.IsReady(&allNodes.Items[i]) {
-						workerNodes = append(workerNodes, &allNodes.Items[i])
-					}
+			gomega.Eventually(func() error {
+				nodes, err := node.FindWorkersOrAnyReady(ctx, infraFxt.K8SClientset)
+				if err != nil {
+					return err
 				}
-			}
-			gomega.Expect(workerNodes).ToNot(gomega.BeEmpty(), "no ready nodes detected")
-			targetNode = workerNodes[0] // pick random one, this is the simplest random pick
+				if len(nodes) == 0 {
+					return fmt.Errorf("no worker nodes detected")
+				}
+				targetNode = nodes[0] // pick random one, this is the simplest random pick
+				return nil
+			}).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(gomega.Succeed(), "failed to find any worker node")
 		}
+		gomega.Expect(targetNode).ToNot(gomega.BeNil(), "target node must be set (by DRACPU_E2E_TARGET_NODE or by finding a worker)")
 		rootFxt.Log.Info("using worker node", "nodeName", targetNode.Name)
 
+		discoveryCtx, discoveryCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer discoveryCancel()
 		infoPod := discovery.MakePod(infraFxt.Namespace.Name, dracpuTesterImage)
 		infoPod = pinPodToNode(infoPod, targetNode)
-		infoPod, err = e2epod.RunToCompletion(ctx, infraFxt.K8SClientset, infoPod)
+		infoPod, err = e2epod.RunToCompletionWithTimeout(discoveryCtx, infraFxt.K8SClientset, infoPod, 2*time.Minute)
 
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create discovery pod: %v", err)
-		data, err := e2epod.GetLogs(infraFxt.K8SClientset, ctx, infoPod.Namespace, infoPod.Name, infoPod.Spec.Containers[0].Name)
+		data, err := e2epod.GetLogs(infraFxt.K8SClientset, discoveryCtx, infoPod.Namespace, infoPod.Name, infoPod.Spec.Containers[0].Name)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get logs from discovery pod: %v", err)
 		gomega.Expect(json.Unmarshal([]byte(data), &targetNodeCPUInfo)).To(gomega.Succeed())
 

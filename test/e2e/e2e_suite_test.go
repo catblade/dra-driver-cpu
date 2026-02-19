@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -87,15 +88,19 @@ func BeFailedToCreate(fxt *fixture.Fixture) types.GomegaMatcher {
 }
 
 func hasCreateFailureSignal(status v1.ContainerStatus) bool {
+	// Current state Waiting: kubelet could not start the container and left it Waiting with a create-failure reason/message.
 	if status.State.Waiting != nil && isCreateFailureReason(status.State.Waiting.Reason, status.State.Waiting.Message) {
 		return true
 	}
+	// Current state Terminated: container was started then exited with a create-failure reason/message (e.g. failed during startup).
 	if status.State.Terminated != nil && isCreateFailureReason(status.State.Terminated.Reason, status.State.Terminated.Message) {
 		return true
 	}
+	// Last termination Waiting: a previous attempt left the container in Waiting with a create-failure signal (e.g. before a restart).
 	if status.LastTerminationState.Waiting != nil && isCreateFailureReason(status.LastTerminationState.Waiting.Reason, status.LastTerminationState.Waiting.Message) {
 		return true
 	}
+	// Last termination Terminated: a previous run terminated with a create-failure signal (e.g. "already bound" or CreateContainerError).
 	if status.LastTerminationState.Terminated != nil && isCreateFailureReason(status.LastTerminationState.Terminated.Reason, status.LastTerminationState.Terminated.Message) {
 		return true
 	}
@@ -106,7 +111,7 @@ func isCreateFailureReason(reason, message string) bool {
 	if reason == reasonCreateContainerError {
 		return true
 	}
-	combined := strings.ToLower(reason + " " + message)
+	combined := strings.ToLower(fmt.Sprintf("%s %s", reason, message))
 	return strings.Contains(combined, "createcontainererror") || strings.Contains(combined, "already bound")
 }
 
@@ -222,10 +227,10 @@ func makeTesterPodBestEffort(ns, image string) *v1.Pod {
 	}
 }
 
-func mustCreateBestEffortPod(ctx context.Context, fxt *fixture.Fixture, nodeName, dracpuTesterImage string) *v1.Pod {
+func mustCreateBestEffortPod(ctx context.Context, fxt *fixture.Fixture, node *v1.Node, dracpuTesterImage string) *v1.Pod {
 	fixture.By("creating a best-effort reference pod")
 	pod := makeTesterPodBestEffort(fxt.Namespace.Name, dracpuTesterImage)
-	pod = e2epod.PinToNode(pod, nodeName)
+	pod = e2epod.PinToNode(pod, node)
 	pod, err := e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create tester pod: %v", err)
 	return pod

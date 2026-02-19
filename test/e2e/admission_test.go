@@ -58,6 +58,7 @@ var _ = ginkgo.Describe("Admission Webhook", ginkgo.Ordered, func() {
 		gomega.Expect(deletePod(ctx, fxt.K8SClientset, createdPod)).To(gomega.Succeed())
 	})
 
+	// allows multiple claims that match per-container cpu requests: pod with two containers, each with a claim and matching CPU request, is admitted.
 	ginkgo.It("allows multiple claims that match per-container cpu requests", func(ctx context.Context) {
 		claim4 := makeCountClaim(fxt.Namespace.Name, "cpu-request-4-cpus", 4)
 		claim6 := makeCountClaim(fxt.Namespace.Name, "cpu-request-6-cpus", 6)
@@ -76,6 +77,7 @@ var _ = ginkgo.Describe("Admission Webhook", ginkgo.Ordered, func() {
 		gomega.Expect(deletePod(ctx, fxt.K8SClientset, createdPod)).To(gomega.Succeed())
 	})
 
+	// rejects pods where request count does not match claim count: pod with CPU request not matching claim CPU count receives an Invalid error.
 	ginkgo.It("rejects pods where request count does not match claim count", func(ctx context.Context) {
 		claim := makeCountClaim(fxt.Namespace.Name, "cpu-request-2-cpus", 2)
 		_, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})

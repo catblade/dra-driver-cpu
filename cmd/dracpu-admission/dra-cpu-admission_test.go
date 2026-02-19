@@ -2,7 +2,7 @@
 Copyright 2025 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
+you may not use it except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/admission"
@@ -27,269 +28,52 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-// TestValidatePodClaims_CPURequestMatchesClaimCount ensures a matching request passes.
-func TestValidatePodClaims_CPURequestMatchesClaimCount(t *testing.T) {
-	clientset := fake.NewSimpleClientset(
-		resourceClaim("default", "claim-4", exactCountRequest(4)),
-	)
-
-	handler := &admissionHandler{
-		driverName: admission.DefaultDriverName,
-		clientset:  clientset,
-	}
-
-	pod := podWithClaims("default", "pod-ok", "claim-ref", "claim-4")
-	pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
-		corev1.ResourceCPU: resource.MustParse("4"),
-	}
-
-	errs := handler.validatePodClaims(pod)
-	if len(errs) != 0 {
-		t.Fatalf("expected no errors, got %v", errs)
-	}
-}
-
-// TestValidatePodClaims_NoCPURequestWithClaimSucceeds allows claim-only containers.
-func TestValidatePodClaims_NoCPURequestWithClaimSucceeds(t *testing.T) {
-	clientset := fake.NewSimpleClientset(
-		resourceClaim("default", "claim-2", exactCountRequest(2)),
-	)
-
-	handler := &admissionHandler{
-		driverName: admission.DefaultDriverName,
-		clientset:  clientset,
-	}
-
-	pod := podWithClaims("default", "pod-claim-only", "claim-ref", "claim-2")
-
-	errs := handler.validatePodClaims(pod)
-	if len(errs) != 0 {
-		t.Fatalf("expected no errors, got %v", errs)
-	}
-}
-
-// TestValidatePodClaims_MissingClaimDoesNotFail allows asynchronous claim creation.
-func TestValidatePodClaims_MissingClaimDoesNotFail(t *testing.T) {
-	handler := &admissionHandler{
-		driverName: admission.DefaultDriverName,
-		clientset:  fake.NewSimpleClientset(),
-	}
-
-	pod := podWithClaims("default", "pod-missing-claim", "claim-ref", "claim-does-not-exist")
-	pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
-		corev1.ResourceCPU: resource.MustParse("2"),
-	}
-
-	errs := handler.validatePodClaims(pod)
-	if len(errs) != 0 {
-		t.Fatalf("expected no errors, got %v", errs)
-	}
-}
-
-// TestValidatePodClaims_NoCPUAndNoClaimSkipsValidation ensures no-op behavior.
-func TestValidatePodClaims_NoCPUAndNoClaimSkipsValidation(t *testing.T) {
-	handler := &admissionHandler{
-		driverName: admission.DefaultDriverName,
-		clientset:  fake.NewSimpleClientset(),
-	}
-
-	pod := &corev1.Pod{}
-
-	errs := handler.validatePodClaims(pod)
-	if len(errs) != 0 {
-		t.Fatalf("expected no errors, got %v", errs)
-	}
-}
-
-// TestValidatePodClaims_CPUMismatchRejected rejects mismatched CPU requests.
-func TestValidatePodClaims_CPUMismatchRejected(t *testing.T) {
-	clientset := fake.NewSimpleClientset(
-		resourceClaim("default", "claim-4", exactCountRequest(4)),
-	)
-
-	handler := &admissionHandler{
-		driverName: admission.DefaultDriverName,
-		clientset:  clientset,
-	}
-
-	pod := podWithClaims("default", "pod-mismatch", "claim-ref", "claim-4")
-	pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
-		corev1.ResourceCPU: resource.MustParse("2"),
-	}
-
-	errs := handler.validatePodClaims(pod)
-	if len(errs) == 0 {
-		t.Fatal("expected errors, got none")
-	}
-}
-
-// TestValidatePodClaims_CPUQuantityMustBeInteger rejects fractional requests.
-func TestValidatePodClaims_CPUQuantityMustBeInteger(t *testing.T) {
-	clientset := fake.NewSimpleClientset(
-		resourceClaim("default", "claim-2", exactCountRequest(2)),
-	)
-
-	handler := &admissionHandler{
-		driverName: admission.DefaultDriverName,
-		clientset:  clientset,
-	}
-
-	pod := podWithClaims("default", "pod-fractional", "claim-ref", "claim-2")
-	pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
-		corev1.ResourceCPU: resource.MustParse("500m"),
-	}
-
-	errs := handler.validatePodClaims(pod)
-	if len(errs) == 0 {
-		t.Fatal("expected errors, got none")
-	}
-}
-
-// TestValidatePodClaims_IndividualSliceUsesCoreID counts coreID devices per claim.
-func TestValidatePodClaims_IndividualSliceUsesCoreID(t *testing.T) {
-	clientset := fake.NewSimpleClientset(
-		resourceClaimWithAllocation("default", "claim-2", []resourceapi.DeviceRequestAllocationResult{
-			{Request: "req", Driver: admission.DefaultDriverName, Pool: "pool", Device: "cpudev001"},
-			{Request: "req", Driver: admission.DefaultDriverName, Pool: "pool", Device: "cpudev002"},
-		}),
-		resourceSliceWithCoreIDs([]string{"cpudev001", "cpudev002"}),
-	)
-
-	handler := &admissionHandler{
-		driverName: admission.DefaultDriverName,
-		clientset:  clientset,
-	}
-
-	pod := podWithClaims("default", "pod-coreid", "claim-ref", "claim-2")
-	pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
-		corev1.ResourceCPU: resource.MustParse("2"),
-	}
-
-	errs := handler.validatePodClaims(pod)
-	if len(errs) != 0 {
-		t.Fatalf("expected no errors, got %v", errs)
-	}
-}
-
-// TestCPURequestCount_RoundsFractionalToOne verifies fractional CPU rounds up to 1.
-func TestCPURequestCount_RoundsFractionalToOne(t *testing.T) {
-	count := cpuRequestCount(resource.MustParse("500m"))
-	if count != 1 {
-		t.Fatalf("expected count to round to 1, got %d", count)
-	}
-}
-
-// resourceClaim builds a ResourceClaim object for tests.
-func resourceClaim(namespace, name string, req resourceapi.ExactDeviceRequest) *resourceapi.ResourceClaim {
-	return &resourceapi.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      name,
-		},
+// TestAdmissionHandler_ValidatePodClaimsWiring ensures the handler implements
+// ClaimCPUCountGetter and that admission.ValidatePodClaims works when called with it.
+func TestAdmissionHandler_ValidatePodClaimsWiring(t *testing.T) {
+	claim := &resourceapi.ResourceClaim{ //nolint:exhaustruct
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "claim-4"},
 		Spec: resourceapi.ResourceClaimSpec{
 			Devices: resourceapi.DeviceClaim{
 				Requests: []resourceapi.DeviceRequest{
 					{
 						Name:    "req",
-						Exactly: &req,
+						Exactly: &resourceapi.ExactDeviceRequest{DeviceClassName: admission.DefaultDriverName, Count: 4},
 					},
 				},
 			},
 		},
 	}
-}
-
-// resourceClaimWithAllocation builds a ResourceClaim with allocation results.
-func resourceClaimWithAllocation(namespace, name string, results []resourceapi.DeviceRequestAllocationResult) *resourceapi.ResourceClaim {
-	return &resourceapi.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      name,
-		},
-		Spec: resourceapi.ResourceClaimSpec{
-			Devices: resourceapi.DeviceClaim{
-				Requests: []resourceapi.DeviceRequest{
-					{
-						Name:    "req",
-						Exactly: &resourceapi.ExactDeviceRequest{DeviceClassName: admission.DefaultDriverName, Count: int64(len(results))},
-					},
-				},
-			},
-		},
-		Status: resourceapi.ResourceClaimStatus{
-			Allocation: &resourceapi.AllocationResult{
-				Devices: resourceapi.DeviceAllocationResult{Results: results},
-			},
-		},
+	clientset := fake.NewSimpleClientset(claim)
+	handler := &admissionHandler{
+		driverName:         admission.DefaultDriverName,
+		clientset:          clientset,
+		claimGetRetryWait:  0,
+		claimGetRetryTotal: 0,
 	}
-}
 
-// exactCountRequest builds a dra.cpu ExactDeviceRequest with a count.
-func exactCountRequest(count int64) resourceapi.ExactDeviceRequest {
-	return resourceapi.ExactDeviceRequest{
-		DeviceClassName: admission.DefaultDriverName,
-		Count:           count,
-	}
-}
-
-// resourceSliceWithCoreIDs builds a ResourceSlice with coreID attributes per device.
-func resourceSliceWithCoreIDs(deviceNames []string) *resourceapi.ResourceSlice {
-	devices := make([]resourceapi.Device, 0, len(deviceNames))
-	for i, name := range deviceNames {
-		coreID := int64(i)
-		devices = append(devices, resourceapi.Device{
-			Name: name,
-			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				resourceapi.QualifiedName("dra.cpu/coreID"): {IntValue: &coreID},
-			},
-		})
-	}
-	return &resourceapi.ResourceSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "slice-coreid",
-		},
-		Spec: resourceapi.ResourceSliceSpec{
-			Driver: admission.DefaultDriverName,
-			Pool: resourceapi.ResourcePool{
-				Name:               "pool",
-				Generation:         1,
-				ResourceSliceCount: 1,
-			},
-			NodeName: nil,
-			Devices:  devices,
-		},
-	}
-}
-
-// podWithClaims builds a Pod referencing a ResourceClaim by name.
-func podWithClaims(namespace, name, claimRefName, claimName string) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      name,
-		},
+	pod := &corev1.Pod{ //nolint:exhaustruct
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod-ok"},
 		Spec: corev1.PodSpec{
 			ResourceClaims: []corev1.PodResourceClaim{
-				{
-					Name:              claimRefName,
-					ResourceClaimName: strPtr(claimName),
-				},
+				{Name: "claim-ref", ResourceClaimName: strPtr("claim-4")},
 			},
 			Containers: []corev1.Container{
 				{
 					Name: "main",
 					Resources: corev1.ResourceRequirements{
-						Claims: []corev1.ResourceClaim{
-							{Name: claimRefName},
-						},
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+						Claims:   []corev1.ResourceClaim{{Name: "claim-ref"}},
 					},
 				},
 			},
 		},
 	}
+
+	errs := admission.ValidatePodClaims(context.Background(), pod, admission.DefaultDriverName, handler)
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
 }
 
-// strPtr returns a string pointer for convenience in tests.
-func strPtr(value string) *string {
-	return &value
-}
+func strPtr(s string) *string { return &s }

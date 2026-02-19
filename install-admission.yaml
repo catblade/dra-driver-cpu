@@ -74,6 +74,10 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: dracpu-admission
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
       containers:
       - name: dracpu-admission
         image: us-central1-docker.pkg.dev/k8s-staging-images/dra-driver-cpu/dra-driver-cpu:latest

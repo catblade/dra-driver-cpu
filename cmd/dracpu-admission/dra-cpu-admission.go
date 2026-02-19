@@ -46,10 +46,11 @@ import (
 )
 
 const (
-	defaultBindAddress        = ":9443"
-	maxBodyBytes              = 1 << 20
-	defaultClaimGetRetryWait  = 50 * time.Millisecond
-	defaultClaimGetRetryTotal = 500 * time.Millisecond
+	defaultBindAddress            = ":9443"
+	maxBodyBytes                  = 1 << 20
+	defaultClaimGetRetryWait      = 50 * time.Millisecond
+	defaultClaimGetRetryTotal     = 500 * time.Millisecond
+	defaultAdmissionReviewTimeout = 8 * time.Second
 )
 
 var (
@@ -199,8 +200,10 @@ func (h *admissionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dispatch validation and attach the response to the review.
-	response := h.handleReview(review.Request)
+	// Dispatch validation with a timeout so we do not hold the request longer than the server write timeout.
+	ctx, cancel := context.WithTimeout(r.Context(), defaultAdmissionReviewTimeout)
+	defer cancel()
+	response := h.handleReview(ctx, review.Request)
 	response.UID = review.Request.UID
 	review.Response = response
 	review.TypeMeta = metav1.TypeMeta{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview"}
@@ -217,7 +220,7 @@ func (h *admissionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReview routes admission validation by resource type and operation. Returns: AdmissionResponse.
-func (h *admissionHandler) handleReview(req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+func (h *admissionHandler) handleReview(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
 	// Only validate create and update requests.
 	if req.Operation != admissionv1.Create && req.Operation != admissionv1.Update {
 		return &admissionv1.AdmissionResponse{Allowed: true}
@@ -248,7 +251,7 @@ func (h *admissionHandler) handleReview(req *admissionv1.AdmissionRequest) *admi
 		return deny(fmt.Sprintf("failed to decode Pod: %v", err))
 	}
 
-	errs := h.validatePodClaims(&pod)
+	errs := admission.ValidatePodClaims(ctx, &pod, h.driverName, h)
 	if len(errs) > 0 {
 		return deny(strings.Join(errs, "; "))
 	}
@@ -300,88 +303,13 @@ func mustTLSConfig(certFile, keyFile string) *tls.Config {
 	return &tls.Config{Certificates: []tls.Certificate{cert}}
 }
 
-// validatePodClaims enforces CPU request parity with dra.cpu claims. Returns: validation errors.
-func (h *admissionHandler) validatePodClaims(pod *corev1.Pod) []string {
-
-	// No accounting needed for empty pods or those without DRA claims.
-	if pod == nil || len(pod.Spec.ResourceClaims) == 0 {
-		return nil
-	}
-	// Build a map from pod claim references to actual ResourceClaim names.
-	claimNameToResource := make(map[string]string)
-	for _, rc := range pod.Spec.ResourceClaims {
-		if rc.Name == "" || rc.ResourceClaimName == nil {
-			continue
-		}
-		claimNameToResource[rc.Name] = *rc.ResourceClaimName
-	}
-
-	if len(claimNameToResource) == 0 {
-		return nil
-	}
-
-	var errs []string
-	for _, container := range pod.Spec.Containers {
-		// Extract the integer CPU request for this container.
-		cpuRequestValue := int64(0)
-		cpuQuantity, cpuSpecified := container.Resources.Requests[corev1.ResourceCPU]
-		if cpuSpecified {
-			cpuRequestValue = cpuRequestCount(cpuQuantity)
-		}
-		// Sum the CPU count across all dra.cpu claims referenced by the container.
-		totalClaimCPUs := int64(0)
-		for _, claim := range container.Resources.Claims {
-			resourceClaimName, ok := claimNameToResource[claim.Name]
-			if !ok {
-				continue
-			}
-			claimCPUs, err := h.claimCPUCount(pod.Namespace, resourceClaimName)
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("container %q: failed to get ResourceClaim %q: %v", container.Name, resourceClaimName, err))
-				continue
-			}
-			totalClaimCPUs += claimCPUs
-		}
-
-		// Skip containers that define neither a CPU request nor a dra.cpu claim.
-		if !cpuSpecified && totalClaimCPUs == 0 {
-			continue
-		}
-
-		// If only dra.cpu claims are present, skip comparison.
-		if totalClaimCPUs > 0 && !cpuSpecified {
-			continue
-		}
-
-		// Enforce exact match to claim CPU count.
-		if totalClaimCPUs > 0 && cpuRequestValue != totalClaimCPUs {
-			errs = append(errs, fmt.Sprintf("container %q: expected %d CPU cores from dra.cpu claims, got %d in cpu requests", container.Name, totalClaimCPUs, cpuRequestValue))
-		}
-	}
-
-	return errs
-}
-
-// cpuRequestCount normalizes a CPU quantity to integer cores. Returns: count.
-func cpuRequestCount(cpuQuantity resource.Quantity) int64 {
-	value, ok := cpuQuantity.AsInt64()
-	if !ok {
-		// Round any fractional CPU request up to 1.
-		return 1
-	}
-	if value < 1 {
-		return 1
-	}
-	intQuantity := resource.NewQuantity(value, cpuQuantity.Format)
-	if cpuQuantity.Cmp(*intQuantity) != 0 {
-		// Round any fractional CPU request up to 1.
-		return 1
-	}
-	return value
+// ClaimCPUCount implements admission.ClaimCPUCountGetter for pod validation.
+func (h *admissionHandler) ClaimCPUCount(ctx context.Context, namespace, claimName string) (int64, error) {
+	return h.claimCPUCount(ctx, namespace, claimName)
 }
 
 // claimCPUCount totals dra.cpu device requests within a ResourceClaim. Returns: total, error.
-func (h *admissionHandler) claimCPUCount(namespace, name string) (int64, error) {
+func (h *admissionHandler) claimCPUCount(ctx context.Context, namespace, name string) (int64, error) {
 	// Fetch the ResourceClaim and sum CPU requests for this driver.
 	// Claims can be created asynchronously (for example from Pod claim templates),
 	// so retry briefly on NotFound before treating the claim as not yet available.
@@ -397,7 +325,7 @@ func (h *admissionHandler) claimCPUCount(namespace, name string) (int64, error) 
 	}
 	deadline := time.Now().Add(totalWait)
 	for {
-		claim, err = h.clientset.ResourceV1().ResourceClaims(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		claim, err = h.clientset.ResourceV1().ResourceClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err == nil {
 			break
 		}
@@ -407,11 +335,15 @@ func (h *admissionHandler) claimCPUCount(namespace, name string) (int64, error) 
 		if time.Now().After(deadline) {
 			return 0, nil
 		}
-		time.Sleep(retryWait)
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(retryWait):
+		}
 	}
 
 	// Prefer allocated device info when available.
-	if total, err := h.claimCPUCountFromSlices(claim); err != nil || total > 0 {
+	if total, err := h.claimCPUCountFromSlices(ctx, claim); err != nil || total > 0 {
 		return total, err
 	}
 
@@ -440,7 +372,7 @@ func durationFromEnv(name string, fallback time.Duration) time.Duration {
 }
 
 // claimCPUCountFromSlices counts CPU total by looking up allocated devices in ResourceSlices. Returns: total, error.
-func (h *admissionHandler) claimCPUCountFromSlices(claim *resourceapi.ResourceClaim) (int64, error) {
+func (h *admissionHandler) claimCPUCountFromSlices(ctx context.Context, claim *resourceapi.ResourceClaim) (int64, error) {
 	if claim == nil || claim.Status.Allocation == nil || len(claim.Status.Allocation.Devices.Results) == 0 {
 		return 0, nil
 	}
@@ -462,7 +394,7 @@ func (h *admissionHandler) claimCPUCountFromSlices(claim *resourceapi.ResourceCl
 	selector := fields.SelectorFromSet(fields.Set{
 		resourceapi.ResourceSliceSelectorDriver: h.driverName,
 	})
-	slices, err := h.clientset.ResourceV1().ResourceSlices().List(context.Background(), metav1.ListOptions{
+	slices, err := h.clientset.ResourceV1().ResourceSlices().List(ctx, metav1.ListOptions{
 		FieldSelector: selector.String(),
 	})
 	if err != nil {
