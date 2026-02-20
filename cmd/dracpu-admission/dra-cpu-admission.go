@@ -200,7 +200,8 @@ func (h *admissionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dispatch validation with a timeout so we do not hold the request longer than the server write timeout.
+	// Use a single request-scoped context with timeout for the whole validation chain so
+	// all API calls and retries respect the admission timeout.
 	ctx, cancel := context.WithTimeout(r.Context(), defaultAdmissionReviewTimeout)
 	defer cancel()
 	response := h.handleReview(ctx, review.Request)
@@ -309,6 +310,7 @@ func (h *admissionHandler) ClaimCPUCount(ctx context.Context, namespace, claimNa
 }
 
 // claimCPUCount totals dra.cpu device requests within a ResourceClaim. Returns: total, error.
+// It uses the same ctx as the rest of the admission chain so retries and API calls respect the request timeout.
 func (h *admissionHandler) claimCPUCount(ctx context.Context, namespace, name string) (int64, error) {
 	// Fetch the ResourceClaim and sum CPU requests for this driver.
 	// Claims can be created asynchronously (for example from Pod claim templates),
@@ -323,7 +325,11 @@ func (h *admissionHandler) claimCPUCount(ctx context.Context, namespace, name st
 	if retryWait <= 0 {
 		retryWait = defaultClaimGetRetryWait
 	}
-	deadline := time.Now().Add(totalWait)
+	// Bound retry deadline by the request context so we don't retry past the admission timeout.
+	retryDeadline := time.Now().Add(totalWait)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(retryDeadline) {
+		retryDeadline = ctxDeadline
+	}
 	for {
 		claim, err = h.clientset.ResourceV1().ResourceClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err == nil {
@@ -332,14 +338,26 @@ func (h *admissionHandler) claimCPUCount(ctx context.Context, namespace, name st
 		if !apierrors.IsNotFound(err) {
 			return 0, err
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(retryDeadline) {
+			return 0, nil
+		}
+		sleepFor := retryWait
+		if remaining := time.Until(retryDeadline); remaining < sleepFor {
+			sleepFor = remaining
+		}
+		if sleepFor <= 0 {
 			return 0, nil
 		}
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
-		case <-time.After(retryWait):
+		case <-time.After(sleepFor):
 		}
+	}
+
+	// Reject pods that reference a claim already allocated (e.g. to another pod).
+	if claim.Status.Allocation != nil {
+		return 0, admission.ErrClaimAlreadyAllocated
 	}
 
 	// Prefer allocated device info when available.

@@ -106,13 +106,6 @@ func validateExactDeviceRequest(requestName string, req *resourceapi.ExactDevice
 }
 
 func isPositiveIntegerQuantity(quantity resource.Quantity) bool {
-	value, ok := quantity.AsInt64()
-	if !ok {
-		return false
-	}
-	if value < 1 {
-		return false
-	}
-	intQuantity := resource.NewQuantity(value, quantity.Format)
-	return quantity.Cmp(*intQuantity) == 0
+	value := quantity.Value()
+	return value >= 1 && value*1000 == quantity.MilliValue()
 }

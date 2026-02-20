@@ -77,13 +77,25 @@ var _ = ginkgo.Describe("Admission Webhook", ginkgo.Ordered, func() {
 		gomega.Expect(deletePod(ctx, fxt.K8SClientset, createdPod)).To(gomega.Succeed())
 	})
 
-	// rejects pods where request count does not match claim count: pod with CPU request not matching claim CPU count receives an Invalid error.
+	// rejects pods where total CPU request does not match dra.cpu claim total (pod-level: must match exactly).
 	ginkgo.It("rejects pods where request count does not match claim count", func(ctx context.Context) {
-		claim := makeCountClaim(fxt.Namespace.Name, "cpu-request-2-cpus", 2)
+		claim := makeCountClaim(fxt.Namespace.Name, "cpu-claim-mismatch-4", 4)
 		_, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
-		pod := makePodWithClaim(fxt.Namespace.Name, "pod-cpu-mismatch", "pod-cpu-claim-ref", claim.Name, 4)
+		pod := makePodWithClaim(fxt.Namespace.Name, "pod-cpu-mismatch", "pod-cpu-claim-ref", claim.Name, 2)
+		_, err = fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
+		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue(), fmt.Sprintf("expected invalid error, got: %v", err))
+	})
+
+	// rejects pods where total CPU request exceeds dra.cpu claim total (must match exactly).
+	ginkgo.It("rejects pods where cpu request exceeds claim count", func(ctx context.Context) {
+		claim := makeCountClaim(fxt.Namespace.Name, "cpu-claim-excess-2", 2)
+		_, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+		pod := makePodWithClaim(fxt.Namespace.Name, "pod-cpu-excess", "pod-cpu-claim-ref", claim.Name, 4)
 		_, err = fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		gomega.Expect(err).To(gomega.HaveOccurred())
 		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue(), fmt.Sprintf("expected invalid error, got: %v", err))
@@ -97,16 +109,16 @@ var _ = ginkgo.Describe("Admission Webhook", ginkgo.Ordered, func() {
 		gomega.Expect(deletePod(ctx, fxt.K8SClientset, createdPod)).To(gomega.Succeed())
 	})
 
-	ginkgo.It("allows claim-only pods without cpu requests", func(ctx context.Context) {
+	// Pod-level validation requires total CPU request to match claim total; claim-only (no CPU request) is rejected.
+	ginkgo.It("rejects claim-only pods without cpu requests", func(ctx context.Context) {
 		claim := makeCountClaim(fxt.Namespace.Name, "claim-no-cpu", 1)
 		_, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
 		pod := makePodWithClaimOnly(fxt.Namespace.Name, "pod-claim-no-cpu", "pod-claim-ref", claim.Name)
-		createdPod, err := fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
-		gomega.Expect(err).ToNot(gomega.HaveOccurred())
-
-		gomega.Expect(deletePod(ctx, fxt.K8SClientset, createdPod)).To(gomega.Succeed())
+		_, err = fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
+		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue(), fmt.Sprintf("expected invalid error, got: %v", err))
 	})
 })
 

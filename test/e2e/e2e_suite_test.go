@@ -57,7 +57,8 @@ func BeFailedToCreate(fxt *fixture.Fixture) types.GomegaMatcher {
 			return false, errors.New("nil Pod")
 		}
 		lh := fxt.Log.WithValues("podUID", actual.UID, "namespace", actual.Namespace, "name", actual.Name)
-		if actual.Status.Phase != v1.PodPending && actual.Status.Phase != v1.PodRunning {
+		// Only Pending pods can "fail to be created"; Running means creation succeeded.
+		if actual.Status.Phase != v1.PodPending {
 			lh.Info("unexpected phase", "phase", actual.Status.Phase)
 			return false, nil
 		}
